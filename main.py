@@ -1,12 +1,19 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import yfinance as ticker_api
 import json
+from sqlalchemy.orm import Session
+
+# Veritabanı modüllerimizi içe aktarıyoruz
+import models
+from database import engine, SessionLocal
+
+# Veritabanı tablolarını oluştur (Eğer yoksa)
+models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Canlı Trading Terminali Backend API")
 
-# Frontend bağlantılarına izin vermek için CORS ayarı
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,7 +22,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Aktif WebSocket bağlantılarını yönetmek için sınıf
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
@@ -33,53 +39,67 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# Arka planda sürekli çalışıp veri çeken ve yayınlayan asenkron fonksiyon
+# Arka planda veriyi çekip veritabanına KAYDEDEN fonksiyon
+# SADECE BU FONKSİYONU DEĞİŞTİRİYORUZ
 async def fetch_live_data_stream():
-    # İlk aşamada test için küresel/bölgesel bir hisse veya varlık listesi
     tickers = ["AAPL", "MSFT", "BTC-USD"]
     while True:
+        db = SessionLocal()
         try:
             for ticker in tickers:
-                # Yahoo Finance üzerinden anlık fiyatı simüle etmek için veri çekiyoruz
-                data = ticker_api.Ticker(ticker)
-                todays_data = data.history(period='1d')
-                
-                if not todays_data.empty:
-                    latest_price = todays_data['Close'].iloc[-1]
-                    volume = todays_data['Volume'].iloc[-1]
+                try:
+                    data = ticker_api.Ticker(ticker)
+                    todays_data = data.history(period='1d')
                     
-                    payload = {
-                        "ticker": ticker,
-                        "price": round(latest_price, 2),
-                        "volume": int(volume),
-                        "status": "success"
-                    }
-                    
-                    # Bağlı olan tüm tarayıcılara/ekranlara veriyi canlı fırlat
-                    await manager.broadcast(json.dumps(payload))
+                    if not todays_data.empty:
+                        latest_price = todays_data['Close'].iloc[-1]
+                        volume = todays_data['Volume'].iloc[-1]
+                        
+                        # 1. Veritabanına Kayıt İşlemi
+                        db_record = models.StockPrice(
+                            ticker=ticker, 
+                            price=round(float(latest_price), 2), 
+                            volume=int(volume)
+                        )
+                        db.add(db_record)
+                        db.commit()
+                        
+                        # 2. Canlı Yayın (WebSocket) İşlemi
+                        payload = {
+                            "ticker": ticker,
+                            "price": round(float(latest_price), 2),
+                            "volume": int(volume),
+                            "status": "success"
+                        }
+                        await manager.broadcast(json.dumps(payload))
+                except Exception as inner_e:
+                    # Tek bir hissede sorun çıkarsa sistemi çökertme, pas geç
+                    print(f"{ticker} verisi çekilirken hata: {inner_e}")
             
-            # Sunucuyu yormamak ve API sınırlarına takılmamak için saniyelik bekleme
-            await asyncio.sleep(2)
+            # Yahoo Finance bizi bot sanıp engellemesin diye süreyi 15 saniyeye çıkardık
+            await asyncio.sleep(15)
         except Exception as e:
-            print(f"Veri çekme hatası: {e}")
-            await asyncio.sleep(5)
+            print(f"Genel veri çekme hatası: {e}")
+            await asyncio.sleep(15)
+        finally:
+            db.close()
 
-# Backend ayağa kalktığında veri akışını arka planda otomatik başlat
+ 
+            
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(fetch_live_data_stream())
 
 @app.get("/")
 def read_root():
-    return {"message": "Canlı Trading Terminali Backend Aktif!"}
+    return {"message": "Canlı Trading Terminali Aktif! Veriler kaydediliyor..."}
 
-# Frontend'in canlı grafikleri besleyeceği WebSocket kanalı
-@websocket("/ws/live")
+
+@app.websocket("/ws/live")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # İstemciden gelebilecek mesajları (örn: hisse değiştirme talebi) dinle
             data = await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
